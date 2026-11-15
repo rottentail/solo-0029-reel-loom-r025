@@ -38,16 +38,16 @@ python3 -m venv .venv
 | 音频测量 | `POST /assets/{id}/signal`、`waveform`、`loudness`，默认请求 `{}` |
 | 画面索引 | `POST /assets/{id}/contact-sheet`，`{"count":9,"columns":3}` |
 | 导入字幕 | `POST /assets/{id}/cues`，`{"language":"zh-CN","srt":"…"}` |
-| 映射字幕 | `POST /reels/{id}/captions`，`{"revision":1,"tracks":["cue_…"]}` |
+| 映射字幕 | `POST /reels/{id}/captions`，`{"revision":1,"tracks":["cue_…"]}`；按语言合并续读，返回源轨详情、语言 SRT 成员名与含 `origins` 的阅读字幕 |
 | 成片验规 | `GET /artifacts/{id}/conformance`，真实全解码 |
 | 血缘 | `GET /tickets/{id}/lineage` |
-| 交付印本 | `POST /tickets/{id}/imprints`，`{"cue_tracks":[]}`；`GET /imprints/{id}/verify` |
+| 交付印本 | `POST /tickets/{id}/imprints`，`{"cue_tracks":[]}`；选中的源轨按语言冻结为 `captions.<language>.srt` 并写入 manifest；`GET /imprints/{id}/verify` |
 | 下载 | `GET /artifacts/{id}/content`、`/imprints/{id}/content` 或 `/blobs/{sha256}`，支持单一 byte range 与 ETag |
 | 资源 | `POST /assets/{id}/retire`、`restore`；`GET /resources`；`POST /resources/sweep`，默认 `dry_run:true` |
 
 `Idempotency-Key` 可用于创建剪辑卷、渲染单、渲染矩阵；重放返回最初创建响应，当前状态需 GET 回读。不同内容复用同一键返回 409。所有新引用要求 ready 来源；已冻结任务可以继续读退役来源。未完成渲染不能打包。取消运行单是请求，最终状态以 GET 为准；提交成片与成功状态在同一 SQLite 事务中。
 
-视频版式输出 H.264/AAC MP4，音频版式输出 PCM WAV；版式支持 1/2 声道、采样率、常量增益、contain/cover 和恒定帧率。剪辑卷当前采用顺序硬切，不具备多轨、转场、变速、字幕烧录或分段流能力。字幕保留源时间并在投影时按剪辑区间裁切；字幕轨创建后不可变。signal 输出 dBFS，loudness 才是 EBU R128，二者不可互换。
+视频版式输出 H.264/AAC MP4，音频版式输出 PCM WAV；版式支持 1/2 声道、采样率、常量增益、contain/cover 和恒定帧率。剪辑卷当前采用顺序硬切，不具备多轨、转场、变速、字幕烧录或分段流能力。字幕保留源时间并在投影时按剪辑区间裁切；字幕轨创建后不可变。投影按语言独立处理：同一文本在重叠或相接（含跨剪切、复用画面与多轨重叠）的输出区间上合并为一条自然阅读字幕，文本不同绝不合并，真正分开的两次出现仍保留间隔；每条阅读字幕通过 `origins` 保留源轨、源字幕序号与镜段来源。投影预览返回源轨详情、按语言分组的 SRT 成员名（`captions.<language>.srt`）与完整阅读字幕；印本把各语言 SRT 字节、语言清单、源轨与逐条来源一并冻结进 manifest 和 ZIP，`verify` 会重新读取包内字幕核对，新增语言轨只产生可区分的新印本，不会补进历史交付。signal 输出 dBFS，loudness 才是 EBU R128，二者不可互换。
 
 ## 构建与生产流程校验
 

@@ -12,11 +12,12 @@ class Imprints:
     def create(self, ticket_id, raw):
         object_body(raw, ("cue_tracks",))
         track_ids = raw.get("cue_tracks", [])
-        require(isinstance(track_ids, list) and len(track_ids) <= 64 and all(isinstance(x,str) for x in track_ids),
+        require(isinstance(track_ids, list) and len(track_ids) <= 64 and all(isinstance(x, str) for x in track_ids),
                 "invalid_tracks", "cue_tracks must be an array of identifiers")
         ticket = self.tickets.get(ticket_id)
         require(ticket["state"] == "succeeded", "imprint_state", "Only completed renditions can be packaged", 409)
-        caption = self.captions.project(ticket["reel"], ticket["revision"], track_ids) if track_ids else None
+        projection = self.captions.project(ticket["reel"], ticket["revision"], track_ids) if track_ids else None
+        caption = self._freeze_caption(projection) if projection else None
         files = []
         for item in ticket["artifacts"]:
             if item["kind"] != "rendition":
@@ -36,9 +37,10 @@ class Imprints:
             with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_STORED) as archive:
                 self._write(archive, "manifest.json", canonical(manifest).encode())
                 if caption:
-                    self._write(archive, "captions.srt", caption["srt"].encode())
+                    for member in caption["files"]:
+                        self._write(archive, member["name"], member["srt"].encode())
                 for item in files:
-                    info = zipfile.ZipInfo(item["name"], date_time=(1980,1,1,0,0,0))
+                    info = zipfile.ZipInfo(item["name"], date_time=(1980, 1, 1, 0, 0, 0))
                     info.external_attr = 0o644 << 16
                     with archive.open(info, "w") as target, self.blobs.resolve(item["blob"], verify=True).open("rb") as source:
                         for chunk in iter(lambda: source.read(1024*1024), b""):
@@ -54,8 +56,26 @@ class Imprints:
                 self.db.event(db, ticket_id, "imprinted", {"imprint": imprint_id, "blob": blob["hash"]})
                 return self.get(imprint_id, db)
 
+    def _freeze_caption(self, projection):
+        """Freeze the exact projected SRT bytes plus the per-language and source
+        track evidence inside the manifest, so a package proves its own captions
+        instead of relying on whatever the download endpoint returns later."""
+        files = [{"name": block["srt_file"], "language": block["language"],
+                  "cue_count": block["cue_count"], "srt": projection["srts"][block["language"]]}
+                 for block in projection["languages"]]
+        return {
+            "schema": 2,
+            "reel": projection["reel"],
+            "revision": projection["revision"],
+            "reel_hash": projection["reel_hash"],
+            "tracks": projection["tracks"],
+            "languages": projection["languages"],
+            "cues": projection["cues"],
+            "files": files,
+        }
+
     def _write(self, archive, name, content):
-        info = zipfile.ZipInfo(name, date_time=(1980,1,1,0,0,0))
+        info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
         info.external_attr = 0o644 << 16
         archive.writestr(info, content)
 
@@ -77,9 +97,11 @@ class Imprints:
                     "manifest_mismatch", "Packaged manifest differs from frozen record", 409)
             expected_names = {"manifest.json"} | {item["name"] for item in manifest["files"]}
             if manifest["caption"]:
-                expected_names.add("captions.srt")
-                require(archive.read("captions.srt").decode() == manifest["caption"]["srt"],
-                        "caption_mismatch", "Packaged captions differ from frozen projection", 409)
+                caption = manifest["caption"]
+                expected_names.update(member["name"] for member in caption["files"])
+                for member in caption["files"]:
+                    require(archive.read(member["name"]).decode() == member["srt"],
+                            "caption_mismatch", "Packaged captions differ from frozen projection", 409)
             require(set(archive.namelist()) == expected_names, "package_members", "Unexpected package members", 409)
             verified = []
             for item in manifest["files"]:
@@ -91,5 +113,6 @@ class Imprints:
                 require(hasher.hexdigest() == item["blob"] and size == item["size"],
                         "rendition_mismatch", "Packaged media differs from frozen content", 409)
                 verified.append(item["name"])
-        return {"id": imprint_id, "valid": True, "verified_files": verified,
+            verified.extend(member["name"] for member in (manifest["caption"]["files"] if manifest["caption"] else []))
+        return {"id": imprint_id, "valid": True, "verified_files": sorted(verified),
                 "fingerprint": imprint["fingerprint"], "blob": imprint["blob"]}

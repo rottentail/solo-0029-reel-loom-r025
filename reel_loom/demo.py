@@ -110,21 +110,89 @@ class Walkthrough:
             failure = expect_error(lambda: c.request("POST", f"/assets/{a}/contact-sheet", {"count":1,"columns":3}), "sheet_layout")
             return {"artifact": result, "bytes": len(media), "failure": failure}
         if name == "captions":
-            track = c.request("POST", f"/assets/{a}/cues", {"language":"zh-CN",
-                              "srt":"1\n00:00:00,000 --> 00:00:02,900\n潮声\n"})
-            projected = c.request("POST", f'/reels/{self.reel["id"]}/captions', {"revision":1,"tracks":[track["id"]]})
-            require(len(projected["cues"]) == 2, "walkthrough_captions", "A cue spanning cuts must project to both slices")
-            failure = expect_error(lambda: c.request("POST", f"/assets/{a}/cues", {"language":"zh","srt":"broken"}), "cue_format")
-            return {"projection": projected, "track": track, "failure": failure}
+            # Source cues may be split around the cut, overlap each other and be
+            # repeated by another track; the projection must read naturally.
+            srt = ("1\n00:00:00,000 --> 00:00:02,900\n潮声\n\n"
+                   "2\n00:00:00,300 --> 00:00:00,900\n近句\n\n"
+                   "3\n00:00:00,800 --> 00:00:01,100\n断句\n\n"
+                   "4\n00:00:01,100 --> 00:00:01,300\n断句\n\n"
+                   "5\n00:00:01,800 --> 00:00:02,500\n晚句\n")
+            track = c.request("POST", f"/assets/{a}/cues", {"language": "zh-CN", "srt": srt})
+            duplicate = c.request("POST", f"/assets/{a}/cues",
+                                  {"language": "zh-CN", "srt": "1\n00:00:00,000 --> 00:00:02,900\n潮声\n"})
+            english = c.request("POST", f"/assets/{a}/cues",
+                                {"language": "en", "srt": "1\n00:00:00,300 --> 00:00:00,900\nTide\n"})
+            projected = c.request("POST", f'/reels/{self.reel["id"]}/captions',
+                                  {"revision": 1, "tracks": [track["id"], duplicate["id"], english["id"]]})
+            zh_block = next(block for block in projected["languages"] if block["language"] == "zh-CN")
+            en_block = next(block for block in projected["languages"] if block["language"] == "en")
+            zh_cues = [cue for cue in projected["cues"] if cue["language"] == "zh-CN"]
+            en_cues = [cue for cue in projected["cues"] if cue["language"] == "en"]
+            by_text = {cue["text"]: cue for cue in zh_cues}
+            # A cue spanning the cut projects through both slices but reads once.
+            tide = by_text["潮声"]
+            require(len(zh_cues) == 4 and len({c["text"] for c in zh_cues}) == 4,
+                    "walkthrough_captions", "Cut-up and repeated cues must merge into one reading cue each")
+            require(tide["tracks"] == sorted([track["id"], duplicate["id"]])
+                    and len(tide["origins"]) == 4
+                    and sorted({o["slice"] for o in tide["origins"]}) == [0, 1],
+                    "walkthrough_captions", "Merged cue lost its source-track or slice provenance")
+            # Source segments split around the cut join back into one cue.
+            require(len(by_text["断句"]["origins"]) == 2, "walkthrough_captions",
+                    "Split source cues around a cut should continue as one cue")
+            # Different text is never joined: later dialogue cannot appear early.
+            require(by_text["晚句"]["start_tick"] == 1_200_000 and by_text["近句"]["start_tick"] == 100_000,
+                    "walkthrough_captions", "Merging pulled later dialogue onto an earlier interval")
+            # Languages are processed independently and get their own SRT member.
+            require(en_block["cue_count"] == 1 and en_block["srt_file"] == "captions.en.srt"
+                    and zh_block["srt_file"] == "captions.zh-CN.srt", "walkthrough_captions",
+                    "Languages must project independently with per-language SRT files")
+            require(all(cue["language"] == "en" for cue in en_cues), "walkthrough_captions",
+                    "Language blocks must not mix")
+            # Reusing the same picture twice must not flash the same line twice.
+            repeated = c.create_reel("回声复用", [
+                {"asset": a, "in": .3, "out": .8, "label": "第一次"},
+                {"asset": a, "in": .3, "out": .8, "label": "第二次"}])
+            replay = c.request("POST", f'/reels/{repeated["id"]}/captions',
+                               {"revision": 1, "tracks": [english["id"]]})
+            only = replay["cues"][0]
+            require(only["text"] == "Tide" and len(only["origins"]) == 2
+                    and only["start_tick"] == 0 and only["end_tick"] == 1_000_000
+                    and len({o["slice_id"] for o in only["origins"]}) == 2,
+                    "walkthrough_captions", "Repeated picture should read as one continuous cue with both slices provenance")
+            failure = expect_error(lambda: c.request("POST", f"/assets/{a}/cues", {"language": "zh", "srt": "broken"}), "cue_format")
+            return {"projection": projected, "track": track, "repeated": replay, "failure": failure}
         if name == "imprint":
-            failure = expect_error(lambda: c.imprint(self.ticket["id"]), "imprint_state")
+            zh_track = c.request("POST", f"/assets/{a}/cues",
+                                 {"language": "zh-CN", "srt": "1\n00:00:00,000 --> 00:00:02,900\n潮声\n"})
+            en_track = c.request("POST", f"/assets/{a}/cues",
+                                 {"language": "en", "srt": "1\n00:00:00,000 --> 00:00:02,900\nTide\n"})
+            failure = expect_error(lambda: c.imprint(self.ticket["id"], [zh_track["id"]]), "imprint_state")
             ticket = self.finish()
-            imprint = c.imprint(ticket["id"])
+            imprint = c.imprint(ticket["id"], [zh_track["id"]])
+            frozen = imprint["manifest"]["caption"]
+            require([f["name"] for f in frozen["files"]] == ["captions.zh-CN.srt"],
+                    "walkthrough_imprint", "First delivery must freeze only the selected language")
+            require(frozen["tracks"][0]["id"] == zh_track["id"], "walkthrough_imprint",
+                    "Frozen package must record the source tracks it was built from")
             verified = c.request("GET", f'/imprints/{imprint["id"]}/verify')
+            require(set(verified["verified_files"]) >= {"captions.zh-CN.srt"}, "walkthrough_imprint",
+                    "Frozen caption members must be verified from the package")
             self.client.replace_reel(self.reel["id"], 1, "新的草剪", list(reversed(self.slices)))
-            unchanged = c.imprint(ticket["id"])
+            unchanged = c.imprint(ticket["id"], [zh_track["id"]])
             require(imprint["id"] == unchanged["id"], "walkthrough_imprint", "Upstream editing changed frozen imprint")
-            return {"imprint": imprint, "verified": verified, "failure": failure}
+            # A later delivery may add a new language track, but it must never be
+            # back-filled into the already-frozen imprint.
+            revised = c.imprint(ticket["id"], [zh_track["id"], en_track["id"]])
+            require(revised["id"] != imprint["id"], "walkthrough_imprint",
+                    "Adding a language track must produce a distinguishable new delivery")
+            fresh = c.request("GET", f'/imprints/{revised["id"]}/verify')
+            require(set(fresh["verified_files"]) >= {"captions.zh-CN.srt", "captions.en.srt"},
+                    "walkthrough_imprint", "New delivery must verify every language member")
+            old = c.request("GET", f'/imprints/{imprint["id"]}/verify')
+            require(old["valid"] and [f["name"] for f in imprint["manifest"]["caption"]["files"]] == ["captions.zh-CN.srt"],
+                    "walkthrough_imprint", "New tracks must not be added to a historical delivery")
+            return {"imprint": imprint, "revised": revised, "verified": verified, "failure": failure}
         if name == "cancel-retry":
             cancelled = c.request("POST", f'/tickets/{self.ticket["id"]}/cancel')
             require(cancelled["state"] == "cancelled", "walkthrough_cancel", "Queued render did not cancel")

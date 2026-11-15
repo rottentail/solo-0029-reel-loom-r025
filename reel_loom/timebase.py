@@ -41,17 +41,6 @@ def intersect(a, b, c, d):
     return (start, end) if start < end else None
 
 
-def project_interval(start, end, slices):
-    result = []
-    for index, item in enumerate(slices):
-        overlap = intersect(start, end, item["in_tick"], item["out_tick"])
-        if overlap:
-            a, b = overlap
-            offset = item["at_tick"] - item["in_tick"]
-            result.append({"slice": index, "start_tick": a+offset, "end_tick": b+offset})
-    return result
-
-
 def stamp(value, separator=","):
     ms = round(Fraction(value, 1000))
     seconds_total, millis = divmod(ms, 1000)
